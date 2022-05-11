@@ -49,7 +49,7 @@ def main():
         help='number of gpus per node')
     parser.add_argument("--seed", type=int, default=2311)
     parser.add_argument("--num_iterations", type=int, default=10)
-    parser.add_argument("--save_folder", type=str, default='single_sentences_I_1')
+    parser.add_argument("--save_folder", type=str, default='single_sentences_IYou_2')
     parser.add_argument("--prompt_list", type=str, default="prompt_list.txt")
     parser.add_argument("--max_length", type=int, default=20)
     args = parser.parse_args()
@@ -91,7 +91,7 @@ def main():
         inputs = tokenizer(prompt, return_tensors='pt').to(device)
 
         # generate possible continuations
-        output = generate(model, tokenizer,
+        output, _ = generate(model, tokenizer,
                             input_ids=inputs['input_ids'],
                             attention_mask=inputs['attention_mask'],
                             max_length=inputs['input_ids'].shape[1]+args.max_length, num_beams = 1,
@@ -129,6 +129,7 @@ def main():
     ends = []
     for d in decoded:
         ends.append(d.split('.')[-2].strip()+'.')
+        # TODO: replace -2 with the number of periods in the prompt (i.e. 3)
 
 
     rewards = []
@@ -143,8 +144,8 @@ def main():
     ends = [ends[i] for i in sort_idx]
 
     # save results
-    filename1 = Path(args.save_folder) / 'round1_full_generations.txt'
-    filename2 = Path(args.save_folder) / 'round1_ends.txt'
+    filename1 = Path(args.save_folder) / 'full_generations.txt'
+    filename2 = Path(args.save_folder) / 'ends.txt'
     with open(filename1, 'w') as f1, open(filename2, 'w') as f2:
         for gen, end, r in zip(decoded, ends, rewards):
             line = f"{gen} r={r:.3f}\n"
@@ -159,4 +160,4 @@ if __name__ == '__main__':
     main()
 
 
-    # CUDA_VISIBLE_DEVICES=3 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 1000
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 10000

@@ -11,7 +11,7 @@ from transformers import (
     pipeline
 )
 from transformers import pipeline
-from models import GPT2CustomDoubleHeadsModel
+#from models import GPT2CustomDoubleHeadsModel
 import os
 from scipy.special import softmax
 import torch
@@ -169,7 +169,7 @@ def main():
 
                 if args.verbose:
                     print(f'{s} p={selected_prob:.3f} r={selected_reward:.3f}')
-                    import ipdb; ipdb.set_trace()
+                    #import ipdb; ipdb.set_trace()
 
             probs_selected_str = ','.join([str(np.round(p,3)) for p in probs_selected])
             rewards_received_str = ','.join([str(np.round(p,3)) for p in rewards_received])

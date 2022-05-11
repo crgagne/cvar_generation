@@ -9,7 +9,7 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
 )
-from models import GPT2CustomDoubleHeadsModel
+
 import os
 from scipy.special import softmax
 import torch
@@ -47,15 +47,20 @@ def main():
     # parse args
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/pretrained/gpt2-large")
+    parser.add_argument("--value_model", type=str, default="quantile_learner_101_0.1/quantile_learner_epoch95.pkl")
     parser.add_argument('--gpus', default=1, type=int,
         help='number of gpus per node')
     parser.add_argument("--seed", type=int, default=2311)
     parser.add_argument("--num_iterations", type=int, default=10)
-    parser.add_argument("--save_folder", type=str, default='single_sentences_I_1')
+    parser.add_argument("--save_folder", type=str, default='single_sentences_IYou_2')
     parser.add_argument("--prompt_list", type=str, default="prompt_list.txt")
     parser.add_argument("--max_length", type=int, default=20)
     parser.add_argument("--restrict_w_data", action='store_true')
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--top_k", type=int, default=10)
+
+
+
     #parser.add_argument("--n_return", type=int, default=10) # not implemented
     args = parser.parse_args()
     args.save_folder = Path(__file__).parent / 'data' / 'results' / args.save_folder
@@ -81,7 +86,7 @@ def main():
     sentiment_model.to(device);
 
     if args.restrict_w_data:
-        file = args.save_folder / 'round1_ends.txt'
+        file = args.save_folder / 'ends.txt'
         f = open(file, "r")
         sentences = f.readlines()
         sentences = [s.replace('\n','') for s in sentences]
@@ -93,8 +98,8 @@ def main():
         tokenized_sentences = None
 
     # load cvar value model
-    n_quantiles = 5; hidden_dim = 100
-    learning_filename=args.save_folder / 'quantile_learner_100' / 'quantile_learner_epoch200.pkl'
+    learning_filename=args.save_folder / args.value_model
+    n_quantiles = 10; hidden_dim = 101
     Z_network = TD_Learner(config.n_embd, n_quantiles, hidden_dim=hidden_dim).to(device)
     Z_network.load_state_dict(torch.load(learning_filename))
 
@@ -106,13 +111,17 @@ def main():
     alphas = []
     p_storage = []
     pd_storage = []
+    token_storage = []
+    prompt_storage = []
+    cvar_storage = []
+    quantile_storage = []
 
     for i in tqdm(range(args.num_iterations)):
 
         # choose 3 random prompts
         prompt = ' '.join(np.random.choice(prompts, size=3))
 
-        if np.random.binomial(n=1,p=0.5)==1:
+        if np.random.binomial(n=1, p=0.5)==1:
             prompt = prompt.replace('I', 'You')
 
         #prompt = 'I'
@@ -120,6 +129,12 @@ def main():
 
         # tokenize
         inputs = tokenizer(prompt, return_tensors='pt').to(device)
+
+        if i==15:
+            step_by_step=True
+        else:
+            step_by_step=False
+        #step_by_step=False
 
         # generate possible continuations
         output, other_outputs = generate(model, tokenizer,
@@ -129,20 +144,28 @@ def main():
                             temperature=1, num_return_sequences=1,
                             do_sample=True, eos_token_id=13,
                             bad_words_ids = None,
-                            top_k = 10, top_p=0.95,
+                            top_k = args.top_k, top_p=0.95, # set to top 10
                             allowed_word_ids = None,
                             data_to_restrict_w = tokenized_sentences,
                             cvar_alpha = args.alpha,
                             Z_network = Z_network,
                             tokenized_prompt = tokenized_prompt,
                             return_dict_in_generate=False,
+                            step_by_step = step_by_step,
                             )
 
+        #if i==16:
+        #    import ipdb; ipdb.set_trace()
         decoded.extend(tokenizer.batch_decode(output, skip_special_tokens=True))
 
         alphas.append(other_outputs['alphas'])
         p_storage.append(other_outputs['p_storage'])
         pd_storage.append(other_outputs['pd_storage'])
+        token_storage.append(other_outputs['token_storage'])
+        cvar_storage.append(other_outputs['cvar_storage'])
+        prompt_storage.append(prompt)
+        quantile_storage.append(other_outputs['quantile_storage'])
+        #import ipdb; ipdb.set_trace()
 
     # process a bit
     decoded_proc =[]
@@ -162,20 +185,31 @@ def main():
 
         if include:
             decoded_proc.append(d)
+        else:
+            decoded_proc.append('[EXCLUDED]')
 
     decoded = decoded_proc
 
     ends = []
     for d in decoded:
-        ends.append(d.split('.')[-2].strip()+'.')
+        if d !='[EXCLUDED]':
+            ends.append(''.join(d.split('.')[3].strip()+'.'))
+            # TODO: replace -2 with the number of periods in the prompt (i.e. 3)
+        else:
+            ends.append(d)
 
 
     rewards = []
-    for i in range(0,len(ends),20):
-        j = np.min([i+20,len(ends)])
-        rewards.extend(score_sentiment(ends[i:j], sentiment_tokenizer, sentiment_model, device))
+    for e in ends:
+        if e !='[EXCLUDED]':
+            rewards.extend(score_sentiment(e, sentiment_tokenizer, sentiment_model, device))
+        else:
+            rewards.extend([np.nan])
     assert len(rewards)==len(ends)
 
+    decoded_unsorted = decoded.copy()
+    ends_unsorted = ends.copy()
+    rewards_unsorted = rewards.copy()
     sort_idx = np.argsort(rewards)
     rewards = [rewards[i] for i in sort_idx]
     decoded = [decoded[i] for i in sort_idx]
@@ -183,11 +217,11 @@ def main():
 
     # save results
     if args.restrict_w_data:
-        filename1 = Path(args.save_folder) / f'round1_full_generations_cvar_{args.alpha}.txt'
-        filename2 = Path(args.save_folder) / f'round1_ends_cvar_{args.alpha}.txt'
+        filename1 = Path(args.save_folder) / f'full_generations_cvar_{args.alpha}_{args.top_k}.txt'
+        filename2 = Path(args.save_folder) / f'ends_cvar_{args.alpha}_{args.top_k}.txt'
     else:
-        filename1 = Path(args.save_folder) / f'round1_full_generations_cvar_{args.alpha}_unres.txt'
-        filename2 = Path(args.save_folder) / f'round1_ends_cvar_{args.alpha}_unres.txt'
+        filename1 = Path(args.save_folder) / f'full_generations_cvar_{args.alpha}_{args.top_k}_unres.txt'
+        filename2 = Path(args.save_folder) / f'ends_cvar_{args.alpha}_{args.top_k}_unres.txt'
 
     with open(filename1, 'w') as f1, open(filename2, 'w') as f2:
         for gen, end, r in zip(decoded, ends, rewards):
@@ -201,10 +235,18 @@ def main():
     other_outputs['alphas']=alphas
     other_outputs['p_storage']=p_storage
     other_outputs['pd_storage']=pd_storage
+    other_outputs['sentences']=ends_unsorted
+    other_outputs['rewards']=rewards_unsorted
+    other_outputs['sentences_full']=decoded_unsorted
+    other_outputs['token_storage']=token_storage
+    other_outputs['prompt_storage'] = prompt_storage
+    other_outputs['cvar_storage'] = cvar_storage
+    other_outputs['quantile_storage']  = quantile_storage
+
     if args.restrict_w_data:
-        filename3 = Path(args.save_folder) / f'cvar_output_{args.alpha}.pkl'
+        filename3 = Path(args.save_folder) / f'cvar_output_{args.alpha}_{args.top_k}.pkl'
     else:
-        filename3 = Path(args.save_folder) / f'cvar_output_{args.alpha}_unres.pkl'
+        filename3 = Path(args.save_folder) / f'cvar_output_{args.alpha}_{args.top_k}_unres.pkl'
 
     pickle.dump(other_outputs, open(filename3, 'wb'))
 
@@ -218,4 +260,6 @@ if __name__ == '__main__':
     # CUDA_VISIBLE_DEVICES=3 python generate_sentences_w_cvar.py  --model models/pretrained/gpt2-large --num_iterations 50 --restrict_w_data --alpha 0.5
     # CUDA_VISIBLE_DEVICES=3 python generate_sentences_w_cvar.py  --model models/pretrained/gpt2-large --num_iterations 50 --restrict_w_data --alpha 0.05
 
-    # CUDA_VISIBLE_DEVICES=3 python generate_sentences_w_cvar.py  --model models/pretrained/gpt2-large --num_iterations 50 --alpha 0.05 
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentences_w_cvar.py  --model models/pretrained/gpt2-large --num_iterations 50 --alpha 0.05
+
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentences_w_cvar.py  --model models/pretrained/gpt2-large --num_iterations 50 --alpha 0.05

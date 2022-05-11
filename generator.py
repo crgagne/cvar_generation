@@ -80,6 +80,7 @@ def sample(
     cvar_alpha = 1.0,
     Z_network = None,
     tokenized_prompt = None,
+    step_by_step=False,
     **model_kwargs,
 ) -> Union[SampleDecoderOnlyOutput, torch.LongTensor]:
 
@@ -92,6 +93,7 @@ def sample(
     unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
     cur_len = input_ids.shape[-1]
 
+    # CVaR related set-up
     if Z_network is not None:
         n_quantiles = Z_network.num_quant
         taus = (2 * np.arange(n_quantiles) + 1) / (2.0 * n_quantiles)
@@ -105,47 +107,52 @@ def sample(
     alpha_storage = [cvar_alpha]
     p_storage = []
     pd_storage = []
+    token_storage = []
+    cvar_storage = []
+    quantile_storage = []
 
     # auto-regressive generation
     while True:
 
-        input_ids_wo_prompt = input_ids.detach().clone()
-        input_ids_wo_prompt = input_ids_wo_prompt[:, tokenized_prompt.shape[1]:]
+        # if generating with a prompt, but don't want to use the prompt for getting next state probabilities.
+        if tokenized_prompt is not None:
+            input_ids_wo_prompt = input_ids.detach().clone()
+            input_ids_wo_prompt = input_ids_wo_prompt[:, tokenized_prompt.shape[1]:]
 
         # prepare model inputs this will be subclasased by the model
         model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-        model_inputs['input_ids']=input_ids ## TOTAL HACK; I think something about using the model to get hidden states makes the prepareinputs diferentls
 
-        with torch.no_grad(): ## I'm adding in
+        with torch.no_grad(): # I'm adding in
 
-            # forward pass to get next token
-            # outputs = model(
-            #     **model_inputs,
-            #     return_dict=True,
-            #     output_attentions=output_attentions,
-            #     output_hidden_states=output_hidden_states,
-            # )
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=model_inputs['attention_mask'],
-                return_dict=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-            )
-
+            #forward pass to get next token (more efficient)
+            if tokenized_prompt is None:
+                outputs = model(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+            else: # (less efficient, but necessary when calling the model below for CVaR; not sure why atm)
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=model_inputs['attention_mask'],
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
 
         try:
-            next_token_logits = outputs.logits[:, -1, :] #  outputs.logits.shape is [num_seq, seq_len, vocab_size]
+            next_token_logits = outputs.logits[:, -1, :] #  shape is [num_seq, seq_len, vocab_size]
         except:
             next_token_logits = outputs[0][:, -1, :]
 
         # pre-process distribution
+        #   at the moment, it's just a minimum length processor, and if the sequence is not long enough,
+        #   it sets the logit for EOS to -inf, so that it can't be selected
         next_token_scores = logits_processor(input_ids, next_token_logits) # logits-->'scores';
-            # at the moment, it's just a minimum length processor, and if the sequence is not long enough,
-            # it sets the logit for EOS to -inf, so that it can't be selected
 
-        # manually restrict using a known dataset (taking into account the prompt)
-        # TODO: change so that you have input_ids without prompt and use that...
+        # manually restrict using a known dataset
+        #   (taking into account the prompt)
         if data_to_restrict_w is not None:
             if input_ids_wo_prompt.shape[1]==0:
                 allowed_next_toks = list(data_to_restrict_w[:,0].detach().cpu().numpy())
@@ -154,7 +161,8 @@ def sample(
                 allowed_next_toks = list(data_to_restrict_w[sent_sel,input_ids_wo_prompt.shape[1]].detach().cpu().numpy())
             allowed_word_ids = allowed_next_toks
 
-        # manually restrict vocab (allowed_word_ids is list of integers)
+        # manually restrict vocab
+        #  (allowed_word_ids is list of integers)
         if allowed_word_ids is not None:
             banned_mask = torch.ones(next_token_scores.shape[1])
             banned_mask[allowed_word_ids] = 0
@@ -163,9 +171,9 @@ def sample(
             banned_mask = banned_mask.bool().unsqueeze(0).to(model.device) # [1 x 50,000]
             next_token_scores = next_token_scores.masked_fill(banned_mask, -float("inf"))
 
+        # Adjust logits, truncate to top p or top k
+        #   for the [num seq, vocab_size] it sets the non-top-k tokens to -inf
         next_token_scores = logits_warper(input_ids, next_token_scores)
-            # at the moment, it's just a topk tokens one (and temperature if !=1)
-            # for the [num seq, vocab_size] it sets the non-top-k tokens to -inf
 
         # Store scores, attentions and hidden_states when required
         if return_dict_in_generate:
@@ -176,8 +184,10 @@ def sample(
             if output_hidden_states:
                 decoder_hidden_states += ((outputs.hidden_states,))
 
-        # sample
+        # Compute next token probs
         probs = nn.functional.softmax(next_token_scores, dim=-1)
+
+        # Printing Examples
         if probs.shape[0]==1:
             top_k = logits_warper[-1].top_k
             probs_detached = probs.detach().cpu().squeeze()
@@ -185,16 +195,15 @@ def sample(
             top_tokens = sort_idx[0:top_k]
             top_probs = probs_detached[sort_idx][0:top_k] # TODO:
             print(tokenizer.decode(input_ids[0]))
-            #print(top_tokens)
             print(f'top tokens: {tokenizer.decode(top_tokens)}')
             print(f'p:\t{top_probs.numpy().round(2)}')
-            #print(probs_detached[tokenizer.encode(' to')])
-            #print(probs_detached[tokenizer.encode(' walked')])
+
 
         if pcvar:
 
             # get next state value distribution
             Vp = []
+            Vp_quantiles = []
             for tok in top_tokens:
                 tok = tok.unsqueeze(-1).to(model.device)
                 input_ids_inner = torch.cat([input_ids_wo_prompt, tok[:, None]], dim=-1)
@@ -211,12 +220,17 @@ def sample(
                     thetas = Z_network(states).detach().cpu().numpy().squeeze()
                 cvars = calc_cvar_from_quantiles(thetas, taus, alphas)
                 Vp.append(cvars)
+                Vp_quantiles.append(thetas)
             Vp = np.array(Vp)
+            Vp_quantiles = np.array(Vp_quantiles) # just for visualizing
 
             p_distorted, xis = distort_probabilities(top_probs.cpu().numpy(), cvar_alpha, alphas, Vp)
 
             p_storage.append(list(top_probs.numpy()))
             pd_storage.append(list(p_distorted))
+            token_storage.append([tokenizer.decode(tok) for tok in top_tokens])
+            cvar_storage.append(Vp)
+            quantile_storage.append(Vp_quantiles)
 
             assert probs.shape[0]==1
             for idx, pd in zip(sort_idx[0:top_k], p_distorted):
@@ -226,6 +240,8 @@ def sample(
             print(cvar_alpha)
             print(f'cvar0:\t{Vp[:,0].round(2)}')
             print(f'cvar1:\t{Vp[:,-1].round(2)}')
+            if step_by_step:
+                import ipdb; ipdb.set_trace()
 
         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
@@ -257,7 +273,10 @@ def sample(
 
     other_outputs = {'alphas': alpha_storage,
                     'p_storage': p_storage,
-                    'pd_storage': pd_storage}
+                    'pd_storage': pd_storage,
+                    'token_storage': token_storage,
+                    'cvar_storage': cvar_storage,
+                    'quantile_storage':quantile_storage}
 
     if return_dict_in_generate:
         return SampleDecoderOnlyOutput(
@@ -297,6 +316,7 @@ def generate(
         cvar_alpha = 1.0,
         Z_network = None,
         tokenized_prompt = None,
+        step_by_step = False,
         **model_kwargs):
 
         # Dealing with arguments #
@@ -367,5 +387,6 @@ def generate(
             cvar_alpha = cvar_alpha,
             Z_network = Z_network,
             tokenized_prompt = tokenized_prompt,
+            step_by_step = step_by_step,
             **model_kwargs,
         )

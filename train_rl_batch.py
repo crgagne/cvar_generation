@@ -53,7 +53,7 @@ def prepare_data(args, tokenizer):
         if args.filter is not None:
             dataset = dataset.filter(lambda example: example['text'].startswith(args.filter))
 
-        ## TODO: consider replacing the '.' 13 token with the pad token, so that it gets assigned to the reward
+        # TODO: consider replacing the '.' 13 token with the pad token, so that it gets assigned to the reward
 
         # tensorize sentiment
         def tensorize(batch):
@@ -77,7 +77,6 @@ def prepare_data(args, tokenizer):
 def calc_state_from_batch(batch, device, model, mdp_mode=False):
 
     if mdp_mode:
-
         states = batch[0].to(device)
         rewards = batch[1].to(device)
         mask = batch[2].unsqueeze(-1).to(device)
@@ -111,20 +110,20 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/pretrained/gpt2-large")
-    parser.add_argument("--data", type=str, default='data/results/single_sentences_I_1/round1_ends.txt')
+    parser.add_argument("--data", type=str, default='data/results/single_sentences_IYou_2/ends.txt')
     parser.add_argument('--gpus', default=1, type=int)
     parser.add_argument("--seed", type=int, default=2311)
-    parser.add_argument("--batch_size", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=40)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--n_quantiles", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--n_quantiles", type=int, default=10)
     parser.add_argument("--mdp_mode", action='store_true')
     parser.add_argument("--max_length", type=int, default=20)
     parser.add_argument("--filter", type=str, default=None)
     parser.add_argument("--linear", action='store_true')
-    parser.add_argument("--hidden_dim", type=int, default=50)
+    parser.add_argument("--hidden_dim", type=int, default=100)
     parser.add_argument("--target_every", type=int, default=10)
-    parser.add_argument("--huber_k", type=float, default=1.)
+    parser.add_argument("--huber_k", type=float, default=0.1)
 
     args = parser.parse_args()
     extra_save = '_linear' if args.linear else '_'+str(args.hidden_dim)
@@ -173,7 +172,7 @@ def main():
     tau = torch.Tensor((2 * np.arange(n_quantiles) + 1) / (2.0 * n_quantiles)).view(1, 1, -1).to(device) # third dimensional will be quantiles
 
     # set up optimizers, and learning rate schedule
-    optimizer = torch.optim.Adam(params=Z_network.parameters(), lr=args.learning_rate) # TODO: consider whether I need just a subset of parameters..
+    optimizer = torch.optim.Adam(params=Z_network.parameters(), lr=args.learning_rate)
 
     log_dict = {}
 
@@ -196,8 +195,9 @@ def main():
             tgt_dist = torch.roll(tgt_dist, shifts=-1, dims=1) # actually turn it into next state
             tgt_dist = tgt_dist*mask
 
-            # compute targets, i.e. set reward for last token in sequence_size
-            # and zero out the last state values (replace with done matrix)
+            # compute targets
+            #   i.e. set reward for last token in sequence_size
+            #   and zero out the last state values (replace with done matrix)
             reward_tensor = torch.zeros(thetas.shape).to(device)
             for i in range(reward_tensor.shape[0]):
                 last_tok_idx = int(torch.argmax(mask[i,:].t()*torch.arange(mask.shape[1]).to(device))) # arange up to max length sequence, multiply by the mask
@@ -210,7 +210,7 @@ def main():
             if n_quantiles==1:
                 loss = (target_thetas - thetas)**2
             else:
-                # first convert thetas to (states x quantiles), and target thetas to (quantiles x states x 1)
+                # Notes: first convert thetas to (states x quantiles), and target thetas to (quantiles x states x 1)
                 # collapsed across batch and seq; the result will be (quantiles x states x quantiles)
                 diff = target_thetas.view(-1, n_quantiles).t().unsqueeze(-1) - thetas.view(-1, n_quantiles)
                 loss = huber(diff, args.huber_k) * (tau - (diff.detach() < 0).float()).abs()
@@ -221,8 +221,7 @@ def main():
 
             epoch_loss+=loss.detach().cpu().numpy()
 
-            # switch target network every 10 batches
-            #if idx % int(len(train_data)*0.1)==0:
+            # switch target network
             if idx % args.target_every==0 and idx !=0:
                Z_network_tgt.load_state_dict(Z_network.state_dict())
 
@@ -231,6 +230,7 @@ def main():
         log_dict = append_to_log(log_dict, 'loss', epoch_loss / idx)
         log_dict = append_to_log(log_dict, 'epoch', epoch)
 
+        # printing for checking its progress
         if args.mdp_mode:
             for state in range(state_dim):
                 state_vec = np.zeros(state_dim)
@@ -258,14 +258,12 @@ def main():
                 print(f' theta_hats: {theta_hats_last}')
                 log_dict = append_to_log(log_dict, example, theta_hats_last)
 
-
+        # save the model and the log
         if (epoch) % 5 == 0 and epoch !=0:
-            # save model and log
             args.save_path.parent.mkdir(parents=True, exist_ok=True)
             fileend = f'_epoch{epoch}.pkl'
             torch.save(Z_network.state_dict(), str(args.save_path).replace('.pkl', fileend))
             pickle.dump(log_dict, open(str(args.log_path).replace('.pkl', fileend), "wb" ))
-            #import ipdb; ipdb.set_trace()
 
 if __name__ == '__main__':
 
@@ -275,3 +273,11 @@ if __name__ == '__main__':
     # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 25
     # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 200 --filter "I am" --batch_size 40 --linear
     # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 1000 --filter "I" --batch_size 40 --hidden_dim 100
+
+    # MDP runs
+    # CUDA_VISIBLE_DEVICES=2 python train_rl_batch.py --epochs 50 --batch_size 40 --hidden_dim 101 --mdp_mode --n_quantiles 20 --target_every 100 --learning_rate 1e-3 --huber_k 0.1
+
+    # New runs
+    # CUDA_VISIBLE_DEVICES=2 python train_rl_batch.py --epochs 100 --batch_size 40 --hidden_dim 101 --n_quantiles 10 --target_every 10 --huber_k 0.1
+
+    # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 100 --batch_size 40 --hidden_dim 101 --n_quantiles 10 --target_every 10 --huber_k 0.1
