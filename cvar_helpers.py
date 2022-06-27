@@ -38,7 +38,7 @@ def calc_cvar_from_quantiles(thetas, taus, alphas):
     # this helps with summing for the first alpha, so that we can say the dtau is 0.05.
     # and then for the other alphas, the dtau are 0.05, 0.1, 0.1, etc.
     # but it seems to over estimate the alpha=1 case in low samples
-    # but in the limit it seems to do well
+    # but in the limit it does well
 
     # eg.
     # rewards_per_state = get_reward_dist_per_state(state, states_all, rewards_all)

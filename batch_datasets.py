@@ -3,12 +3,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 
-def get_batch_dataset(dataset_name):
-
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--dataset_name", type=str, default="The/A",
-    #     help="pretrained model name or path to local checkpoint")
-    # args = parser.parse_args()
+def get_batch_dataset(dataset_name, cache_dir='~/cvar_generation/cache', n_rewards=3):
 
     if dataset_name=='The/A':
         # load dataset
@@ -31,14 +26,25 @@ def get_batch_dataset(dataset_name):
         #dataset_negative = dataset_negative.filter(lambda example: example['sentiment']<=0)
         dataset = concatenate_datasets([dataset_positive, dataset_negative])
 
+    elif 'sentence_chains' in dataset_name:
+
+        dataset_loader_path = Path(__file__).parent / 'dataset_builder_sentence_chains.py'
+        dataset = load_dataset(str(dataset_loader_path),
+                               data_filepath=dataset_name,
+                               cache_dir=cache_dir,
+                               n_rewards=n_rewards)
+
+        dataset=dataset['train']
+
     else:
 
         dataset_loader_path = Path(__file__).parent / 'dataset_builder.py'
         dataset = load_dataset(str(dataset_loader_path),
-                               data_filepath=dataset_name)
+                               data_filepath=dataset_name,
+                               cache_dir=cache_dir)
 
         dataset=dataset['train']
-        
+
     return(dataset)
 
 

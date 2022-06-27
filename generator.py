@@ -58,7 +58,7 @@ def get_logits_warper(model, top_k: int = None, top_p: float = None, temperature
         warpers.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
     if top_k is not None and top_k != 0:
         warpers.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
-        print('warning: changed to doing top_k after top_p')
+        #print('warning: changed to doing top_k after top_p')
     return warpers
 
 def sample(
@@ -71,6 +71,7 @@ def sample(
     max_length: Optional[int] = None,
     pad_token_id: Optional[int] = None,
     eos_token_id: Optional[int] = None,
+    eos_token_id2: Optional[int] = None,
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
     output_scores: Optional[bool] = None,
@@ -81,6 +82,7 @@ def sample(
     Z_network = None,
     tokenized_prompt = None,
     step_by_step=False,
+    use_prompt_for_dist = False,
     **model_kwargs,
 ) -> Union[SampleDecoderOnlyOutput, torch.LongTensor]:
 
@@ -110,6 +112,8 @@ def sample(
     token_storage = []
     cvar_storage = []
     quantile_storage = []
+    successes = []
+    selected_tok_scores_all = []
 
     # auto-regressive generation
     while True:
@@ -168,6 +172,7 @@ def sample(
             banned_mask[allowed_word_ids] = 0
             if data_to_restrict_w is None:
                 banned_mask[eos_token_id] = 0
+                banned_mask[eos_token_id2] = 0
             banned_mask = banned_mask.bool().unsqueeze(0).to(model.device) # [1 x 50,000]
             next_token_scores = next_token_scores.masked_fill(banned_mask, -float("inf"))
 
@@ -206,7 +211,11 @@ def sample(
             Vp_quantiles = []
             for tok in top_tokens:
                 tok = tok.unsqueeze(-1).to(model.device)
-                input_ids_inner = torch.cat([input_ids_wo_prompt, tok[:, None]], dim=-1)
+                if use_prompt_for_dist:
+                    input_ids_inner = torch.cat([input_ids, tok[:, None]], dim=-1)
+                else:
+                    input_ids_inner = torch.cat([input_ids_wo_prompt, tok[:, None]], dim=-1)
+
                 with torch.no_grad():
                     outputs_inner = model(input_ids=input_ids_inner,
                                     attention_mask=torch.ones_like(input_ids_inner),
@@ -224,13 +233,14 @@ def sample(
             Vp = np.array(Vp)
             Vp_quantiles = np.array(Vp_quantiles) # just for visualizing
 
-            p_distorted, xis = distort_probabilities(top_probs.cpu().numpy(), cvar_alpha, alphas, Vp)
+            p_distorted, xis, extra = distort_probabilities(top_probs.cpu().numpy(), cvar_alpha, alphas, Vp)
 
             p_storage.append(list(top_probs.numpy()))
             pd_storage.append(list(p_distorted))
             token_storage.append([tokenizer.decode(tok) for tok in top_tokens])
             cvar_storage.append(Vp)
             quantile_storage.append(Vp_quantiles)
+            successes.append(extra['success'])
 
             assert probs.shape[0]==1
             for idx, pd in zip(sort_idx[0:top_k], p_distorted):
@@ -244,6 +254,10 @@ def sample(
                 import ipdb; ipdb.set_trace()
 
         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        selected_tok_scores = []
+        for nti, nt in enumerate(next_tokens):
+            selected_tok_scores.append(float(next_token_scores[nti,nt].detach().cpu()))
+        selected_tok_scores_all.append(selected_tok_scores)
 
         # adjust alpha
         if pcvar:
@@ -265,10 +279,13 @@ def sample(
 
         # if eos_token was found in one sentence, set sentence to finished
         if eos_token_id is not None:
-            unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long()) # recreates the [1,1,1,0,1] for unfinished sequences
+            not_done = torch.logical_and(next_tokens != eos_token_id,
+                                         next_tokens != eos_token_id2)
+            unfinished_sequences = unfinished_sequences.mul((not_done).long()) # recreates the [1,1,1,0,1] for unfinished sequences
 
         # stop when each sentence is finished, or if we exceed the maximum length
         if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+            #import ipdb; ipdb.set_trace()
             break
 
     other_outputs = {'alphas': alpha_storage,
@@ -276,7 +293,9 @@ def sample(
                     'pd_storage': pd_storage,
                     'token_storage': token_storage,
                     'cvar_storage': cvar_storage,
-                    'quantile_storage':quantile_storage}
+                    'quantile_storage':quantile_storage,
+                    'successes': successes,
+                    'selected_tok_scores_all': selected_tok_scores_all}
 
     if return_dict_in_generate:
         return SampleDecoderOnlyOutput(
@@ -284,7 +303,7 @@ def sample(
             scores=scores,
             attentions=decoder_attentions,
             hidden_states=decoder_hidden_states,
-        )
+        ), other_outputs
     else:
         return input_ids, other_outputs
 
@@ -301,6 +320,7 @@ def generate(
         repetition_penalty: Optional[float] = None,
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
+        eos_token_id2: Optional[int] = None,
         length_penalty: Optional[float] = None,
         no_repeat_ngram_size: Optional[int] = None,
         num_return_sequences: Optional[int] = None,
@@ -317,6 +337,7 @@ def generate(
         Z_network = None,
         tokenized_prompt = None,
         step_by_step = False,
+        use_prompt_for_dist = False,
         **model_kwargs):
 
         # Dealing with arguments #
@@ -325,12 +346,12 @@ def generate(
         do_sample = do_sample if do_sample is not None else model.config.do_sample
         num_return_sequences = (num_return_sequences if num_return_sequences is not None else model.config.num_return_sequences)
         eos_token_id = eos_token_id if eos_token_id is not None else model.config.eos_token_id
+        eos_token_id2 = eos_token_id2 if eos_token_id2 is not None else model.config.eos_token_id
         output_scores = output_scores if output_scores is not None else model.config.output_scores
         output_attentions = output_attentions if output_attentions is not None else model.config.output_attentions
         output_hidden_states = (output_hidden_states if output_hidden_states is not None else model.config.output_hidden_states)
         return_dict_in_generate = (return_dict_in_generate if return_dict_in_generate is not None else model.config.return_dict_in_generate)
         pad_token_id = pad_token_id if pad_token_id is not None else model.config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else model.config.eos_token_id
         model_kwargs["output_attentions"] = output_attentions
         model_kwargs["output_hidden_states"] = output_hidden_states
 
@@ -347,7 +368,8 @@ def generate(
 
         logits_processor = LogitsProcessorList()
         if min_length is not None:
-            logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id=model.config.eos_token_id))
+            logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id=eos_token_id))
+            logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id2=eos_token_id2))
         if bad_words_ids is not None:
             logits_processor.append(NoBadWordsLogitsProcessor(bad_words_ids, eos_token_id))
 
@@ -380,6 +402,7 @@ def generate(
             stopping_criteria=stopping_criteria,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
+            eos_token_id2=eos_token_id2,
             output_scores=output_scores,
             return_dict_in_generate=return_dict_in_generate,
             allowed_word_ids=allowed_word_ids,
@@ -388,5 +411,6 @@ def generate(
             Z_network = Z_network,
             tokenized_prompt = tokenized_prompt,
             step_by_step = step_by_step,
+            use_prompt_for_dist = use_prompt_for_dist,
             **model_kwargs,
         )

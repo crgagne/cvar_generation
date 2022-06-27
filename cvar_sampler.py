@@ -20,27 +20,69 @@ def calculate_next_CVaR(next_states, taus, alphas, states_all=None, rewards_all=
         V.append(cvars)
     return(np.array(V))
 
-def distort_probabilities(p, alpha, alphas, V):
-
-    xis_init = np.random.uniform(alphas[1],1/alpha,len(p))
-    xps = np.arange(len(p))
+def distort_probabilities(p, alpha, alphas, V, max_inner_iters=50, multi_starts_N=10, same_answer_ns=3, same_answer_tol=1e-4):
 
     def sum_to_1_constraint(xi):
         zero = np.dot(xi,p)-1
         return(zero)
 
+    xps = np.arange(len(p))
     cons = ({'type': 'eq', 'fun': sum_to_1_constraint})
     bnds = tuple(((0.0,1.0/alpha) for i in range(len(p))))
 
-    results = minimize(distorted_exp,
-                       xis_init,
-                       args=(V, xps, p, alpha, alphas),
-                       method='SLSQP',
-                       bounds=bnds,
-                       constraints=cons)
+    succeeded_at_least_once = False
+    results_list = []
+    fun_mins = []
+    for iter in range(max_inner_iters):
+
+        xis_init = np.random.uniform(alphas[1],1/alpha,len(p))
+        #dist_probs_init = np.random.dirichlet(np.ones(len(p)),size=1)[0]
+        #xis_init = dist_probs_init/np.array(p)
+        #if np.abs(sum_to_1_constraint(xis_init))>1e-4:
+        #    import ipdb; ipdb.set_trace()
+        #assert np.abs(sum_to_1_constraint(xis_init))<1e-4
+
+        results = minimize(distorted_exp,
+                           xis_init,
+                           args=(V, xps, p, alpha, alphas),
+                           method='SLSQP',
+                           bounds=bnds,
+                           constraints=cons)
+
+        if results.success:
+            succeeded_at_least_once=True
+            results_list.append(results)
+            fun_mins.append(results.fun)
+
+        # exit early if all N minimums are the same
+        if len(fun_mins)>same_answer_ns:
+            minn = np.min(np.array(fun_mins))
+            num_within_tol = np.sum((np.array(fun_mins)-minn)<same_answer_tol)
+            if num_within_tol>=same_answer_ns:
+                break
+
+        # or exit after max number of multi-starts have been exceeded
+        if len(fun_mins)>multi_starts_N:
+            break
+
+        if len(fun_mins)==0:
+            print('inner optimization failed')
+        else:
+            # find minimum over multi-starts
+            argmin_funs = np.argmin(np.array(fun_mins))
+            results = results_list[argmin_funs]
+
     xis = results.x
     p_distorted = p*xis
-    return(p_distorted, xis)
+    if not results.success:
+        print('inner optimization failed')
+
+    extra = {}
+    extra['fun_mins']=fun_mins
+    extra['success']=results.success
+
+    return(p_distorted, xis, extra)
+
 
 def cvar_forward_sampler(P, R, s0, alpha0, n_eps=1, n_quantiles = 10, verbose = False,
                  states_all_prev=None, rewards_all_prev=None, max_seq_len=4):
@@ -57,7 +99,6 @@ def cvar_forward_sampler(P, R, s0, alpha0, n_eps=1, n_quantiles = 10, verbose = 
         alphas_ep = []
         s = s0; r=0; alpha=alpha0
         done = False
-        #import ipdb; ipdb.set_trace()
 
         for i in range(max_seq_len):
 
@@ -78,7 +119,7 @@ def cvar_forward_sampler(P, R, s0, alpha0, n_eps=1, n_quantiles = 10, verbose = 
 
                 # distort probs
                 V = calculate_next_CVaR(next_states, taus, alphas, states_all=states_all_prev, rewards_all=rewards_all_prev)
-                p_distorted, xis = distort_probabilities(p, alpha, alphas, V)
+                p_distorted, xis, _ = distort_probabilities(p, alpha, alphas, V)
                 if np.abs(p_distorted.sum()-1.)>0.05:
                     import ipdb; ipdb.set_trace()
                 p_distorted = p_distorted/np.sum(p_distorted)

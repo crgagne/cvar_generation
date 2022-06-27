@@ -8,8 +8,10 @@ from transformers import (
     GPT2LMHeadModel,
     AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
+    GPTJForCausalLM
 )
-from models import GPT2CustomDoubleHeadsModel
+
 import os
 from scipy.special import softmax
 import torch
@@ -18,10 +20,8 @@ from tqdm import tqdm
 
 from generator import generate
 
-
 def has_numbers(inputString):
     return any(char.isdigit() for char in inputString)
-
 
 def score_sentiment(sentences, sentiment_tokenizer, sentiment_model, device):
 
@@ -49,9 +49,11 @@ def main():
         help='number of gpus per node')
     parser.add_argument("--seed", type=int, default=2311)
     parser.add_argument("--num_iterations", type=int, default=10)
-    parser.add_argument("--save_folder", type=str, default='single_sentences_IYou_2')
+    parser.add_argument("--save_folder", type=str, default='single_sentences_IYou_7GPTJ')
     parser.add_argument("--prompt_list", type=str, default="prompt_list.txt")
     parser.add_argument("--max_length", type=int, default=20)
+    parser.add_argument("--comp_prompts", action='store_true')
+    parser.add_argument("--top_k", type=int, default=10)
     args = parser.parse_args()
     args.save_folder = Path(__file__).parent / 'data' / 'results' / args.save_folder
     print(f'save folder: {args.save_folder}')
@@ -64,10 +66,18 @@ def main():
         device='cpu'
 
     # load model
-    config = GPT2Config.from_pretrained(args.model)
-    tokenizer = GPT2Tokenizer.from_pretrained(args.model)
-    model = GPT2LMHeadModel.from_pretrained(args.model, config=config)
-    model.config.pad_token_id = model.config.eos_token_id
+    if 'gpt-2' in args.model:
+        config = GPT2Config.from_pretrained(args.model)
+        tokenizer = GPT2Tokenizer.from_pretrained(args.model)
+        model = GPT2LMHeadModel.from_pretrained(args.model, config=config)
+        model.config.pad_token_id = model.config.eos_token_id
+    elif 'gpt-j' in args.model:
+        import ipdb; ipdb.set_trace()
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16) # optional to include this precision
+        if args.gpus==0: # haven't tried yet
+            model = GPTJForCausalLM.from_pretrained(args.model, revision="float16", torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+
     model.to(device)
 
     sentiment_tokenizer = AutoTokenizer.from_pretrained('models/pretrained/cardiffnlp-twitter-roberta-base-sentiment')
@@ -79,16 +89,30 @@ def main():
     prompts = f.readlines()
     prompts = [prompt.replace('\n','') for prompt in prompts]
     decoded = []
+    prompt_storage = []
     for i in tqdm(range(args.num_iterations)):
 
         # choose 3 random prompts
-        prompt = ' '.join(np.random.choice(prompts, size=3))
+        if args.comp_prompts:
+            prompt = ' '.join(np.random.choice(prompts, size=3))
+        else:
+            prompt =  np.random.choice(prompts, size=1)[0]
 
-        if np.random.binomial(n=1,p=0.5)==1:
-            prompt = prompt.replace('I', 'You')
+        #import ipdb; ipdb.set_trace()
+
+        #if np.random.binomial(n=1, p=0.5)==1:
+        #    prompt = prompt.replace('I', 'You')
+
 
         # tokenize
         inputs = tokenizer(prompt, return_tensors='pt').to(device)
+
+        if 'gpt-2' in args.model:
+            bad_words = ["\n", "\r", '"']
+            bad_words_ids = [tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
+        else:
+            bad_words = ["\n", "\r", '"']
+            bad_words_ids = [tokenizer.encode(bad_word) for bad_word in bad_words]
 
         # generate possible continuations
         output, _ = generate(model, tokenizer,
@@ -97,17 +121,18 @@ def main():
                             max_length=inputs['input_ids'].shape[1]+args.max_length, num_beams = 1,
                             temperature=1, num_return_sequences=10,
                             do_sample=True, eos_token_id=13,
-                            bad_words_ids = None,
-                            top_k = 0, top_p=0.95,
+                            bad_words_ids = bad_words_ids,
+                            top_k = args.top_k, top_p=0.95,
                             allowed_word_ids = None,
                             )
 
         decoded.extend(tokenizer.batch_decode(output, skip_special_tokens=True))
-
+        prompt_storage.extend([prompt for _ in range(10)])
 
     # process a bit
     decoded_proc =[]
-    for d in decoded:
+    prompt_storage2 = []
+    for d, pr in zip(decoded, prompt_storage):
         include=True
         d = d.replace('\n','').replace('\r','').replace('"','')
         d = d.replace('[','').replace(']','')
@@ -123,17 +148,18 @@ def main():
 
         if include:
             decoded_proc.append(d)
+            prompt_storage2.append(pr)
 
     decoded = decoded_proc
+    prompt_storage = prompt_storage2
+    assert len(decoded)==len(prompt_storage)
 
     ends = []
-    for d in decoded:
-        ends.append(d.split('.')[-2].strip()+'.')
-        # TODO: replace -2 with the number of periods in the prompt (i.e. 3)
-
+    for d,p in zip(decoded, prompt_storage):
+        ends.append(d.replace(p,'').strip())
 
     rewards = []
-    for i in range(0,len(ends),20):
+    for i in range(0,len(ends),20): # 20 is a batch size
         j = np.min([i+20,len(ends)])
         rewards.extend(score_sentiment(ends[i:j], sentiment_tokenizer, sentiment_model, device))
     assert len(rewards)==len(ends)
@@ -160,4 +186,7 @@ if __name__ == '__main__':
     main()
 
 
-    # CUDA_VISIBLE_DEVICES=3 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 10000
+    # CUDA_VISIBLE_DEVICES=2 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 5000
+    # CUDA_VISIBLE_DEVICES=2 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 1000
+
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentences.py  --model models/pretrained/EleutherAI-gpt-j-6B --num_iterations 10 --gpus 0

@@ -11,42 +11,49 @@ from transformers import (
     pipeline
 )
 from transformers import pipeline
-#from models import GPT2CustomDoubleHeadsModel
 import os
 from scipy.special import softmax
 import torch
 import numpy as np
 from tqdm import tqdm
+import scipy
 
 from generator import generate
+
+from difflib import SequenceMatcher
 
 
 def has_numbers(inputString):
     return any(char.isdigit() for char in inputString)
 
 
-def process_decoded(decoded):
+def process_decoded(decoded, n_periods):
 
     # process a bit
     decoded_proc =[]
+    include_list = []
     for d in decoded:
         include=True
         d = d.replace('\n','').replace('\r','').replace('"','')
         d = d.replace('[','').replace(']','')
+
         if d[-1]!='.':
             include=False
-        if '?' in d:
-            include=False
+        #if '?' in d:
+        #    include=False
         if has_numbers(d):
             include=False
         num_words = d.split(' ')
         if len(num_words)<3:
             include=False
+        if d.count('.')!=n_periods:
+            include=False
 
+        include_list.append(include)
         if include:
             decoded_proc.append(d)
 
-    return(decoded_proc)
+    return(decoded_proc, include_list)
 
 def score_sentiment(sentences, sentiment_tokenizer, sentiment_model, device):
 
@@ -75,10 +82,10 @@ def main():
         help='number of gpus per node')
     parser.add_argument("--seed", type=int, default=2311)
     parser.add_argument("--num_iterations", type=int, default=100)
-    parser.add_argument("--save_folder", type=str, default='sentence_chains_I_1')
-    #parser.add_argument("--prompt_list", type=str, default="prompt_list.txt")
+    parser.add_argument("--save_folder", type=str, default='sentence_chains_I_5')
     parser.add_argument("--max_length", type=int, default=20)
     parser.add_argument("--verbose", action='store_true')
+    parser.add_argument("--steps", type=int, default=3)
     args = parser.parse_args()
     args.save_folder = Path(__file__).parent / 'data' / 'results' / args.save_folder
     print(f'save folder: {args.save_folder}')
@@ -100,93 +107,191 @@ def main():
     # entailment model (although using it in zero-shot mode. more like semantic similarity)
     entailment_classifier = pipeline("zero-shot-classification", model='models/pretrained/nli-distilroberta-base')
 
+    # reward model
     sentiment_tokenizer = AutoTokenizer.from_pretrained('models/pretrained/cardiffnlp-twitter-roberta-base-sentiment')
     sentiment_model = AutoModelForSequenceClassification.from_pretrained('models/pretrained/cardiffnlp-twitter-roberta-base-sentiment')
     sentiment_model.to(device);
 
+    bad_words = ['."','?"', "\n", "\r", '"', '_', '"', '\n', 'said','.,','?,','.?']
+    bad_words_ids = [tokenizer.encode(bad_word, add_prefix_space=False) for bad_word in bad_words]
+    bad_words_ids.extend([tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words])
+    bad_words_ids = [bw for bw in bad_words_ids if len(bw)==1]
 
     for i in tqdm(range(args.num_iterations)):
 
-        s = 'I woke up early. I brushed my teeth.'
-        #s = 'Tomorrow I will wake up early. I will brush my teeth. I will have breakfast.'
-        #s = 'Tomorrow I will wake up early. I will have breakfast. I will leave the house.'
-        #s = 'Tomorrow I will wake up early and have my usual breakfast. Afterwards, I will take the train to work.'
+        #s = 'I woke up early. Then I brushed my teeth.'
+
+        s0= ['Tomorrow I will wake up early.',  'I will leave the house.']
+        #s0= ['Tomorrow I will wake up early as I always do.',  'I will leave the house to do errands.']
+        #s0= ['Tomorrow I will wake up early as I always do.',  'I will brush my teeth, eat breakfast, and leave the house to do errands.']
+        s0= ['Let me think about what I need to do tomorrow, because it will be a busy day.',
+            'I need to get the kids ready for school.' ,
+            'I need to feed the dog.']
+        s0= ['Tomorrow will be a busy day.',
+            'I need to go to the doctors.']
+
+
+        # selecting s0 and s2
+        s0s = ['Tomorrow will be an easy day.','Tomorrow will be a busy day.', 'Tomorrow will be a difficult day.']
+        s1s = ["I need to go to the doctor's.", 'I need to go to work.', 'I need to go to the grocery store.', 'I need to clean the house.',  'I need to take that test.',
+                "I will attend my friend's party.", "I will go to the gym.", "I will go on a bike ride.", "I might need to work late." ]
+        s0 = [np.random.choice(s0s), np.random.choice(s1s)]
+
+        s = ' '.join(s0)
+
         rewards_received = []
         probs_selected = []
+        state_storage = s0
 
-        try:
+        for step in range(args.steps):
 
-            for step in range(3):
+            # tokenize
+            inputs = tokenizer(s, return_tensors='pt').to(device)
+            input_ids = inputs['input_ids']
+            mask = inputs['attention_mask']
 
-                # tokenize
-                inputs = tokenizer(s, return_tensors='pt').to(device)
+            # generate possible continuations
+            with torch.no_grad():
+                output, other_outputs = generate(model, tokenizer,
+                                    input_ids=input_ids,
+                                    attention_mask=mask,
+                                    max_length=input_ids.shape[1]+args.max_length,
+                                    num_beams = 1,
+                                    temperature=0.8, # was 0.9 with longer prompt
+                                    num_return_sequences=14,
+                                    do_sample=True,
+                                    eos_token_id=13,
+                                    bad_words_ids = bad_words_ids,
+                                    top_k = 50, top_p=0.90, # was k=0 before with longer prompt; top_p=0.95 before
+                                    allowed_word_ids = None,
+                                    output_scores=True,
+                                    return_dict_in_generate=True,
+                                    )
 
-                # generate possible continuations
-                with torch.no_grad():
-                    output = generate(model, tokenizer,
-                                        input_ids=inputs['input_ids'],
-                                        attention_mask=inputs['attention_mask'],
-                                        max_length=inputs['input_ids'].shape[1]+args.max_length, num_beams = 1,
-                                        temperature=1, num_return_sequences=10,
-                                        do_sample=True, eos_token_id=13,
-                                        bad_words_ids = None,
-                                        top_k = 0, top_p=0.95,
-                                        allowed_word_ids = None,
-                                        output_scores=True,
-                                        return_dict_in_generate=True,
-                                        )
+            # https://discuss.huggingface.co/t/generation-probabilities-how-to-compute-probabilities-of-output-scores-for-gpt2/3175
+            sel_logits = np.array(other_outputs['selected_tok_scores_all']).shape
+            gen_sequences = output.sequences[:, input_ids.shape[-1]:]
+            seq_probs = torch.stack(output.scores, dim=1).softmax(-1)  # -> shape [batch, seq_size, vocab_size]
+            gen_probs = torch.gather(seq_probs, 2, gen_sequences[:, :, None]).squeeze(-1)
+            gmean_prob_per_sequence = scipy.stats.mstats.gmean(gen_probs.detach().cpu().numpy()[:,:], axis=1)
+            mean_prob_per_sequence = np.mean(gen_probs.detach().cpu().numpy()[:,:], axis=1)
+            unique_prob_per_sequence = gen_probs.prod(-1)
 
-                decoded = tokenizer.batch_decode(output['sequences'], skip_special_tokens=True)
-                decoded = process_decoded(decoded)
+            seq_logits = torch.stack(output.scores, dim=1)
+            gen_logits = torch.gather(seq_logits, 2, gen_sequences[:, :, None]).squeeze(-1)
+            gen_logits[gen_logits==-torch.inf]=0.
+            gen_logits_per_sequence = gen_logits.sum(-1).detach().cpu().numpy()
 
-                if len(decoded)==0:
-                    break
+            # losses = []
+            # with torch.no_grad():
+            #     for i in range(output.sequences.shape[0]):
+            #         losses.append(float(model(input_ids = output.sequences[i], labels=output.sequences[i])['loss'].detach().cpu()))
 
-                scores = output['scores']
+            decoded = tokenizer.batch_decode(output['sequences'], skip_special_tokens=True)
+            decoded, include_list = process_decoded(decoded, n_periods=s.count('.')+1)
+            include_list = np.array(include_list)
 
-                # calculate probabilities
-                sp_candidates = []
-                for d in decoded:
-                    sp_candidates.append(d.split('.')[-2].strip()+'.')
-                res = entailment_classifier(s, sp_candidates)
-                probs = res['scores']
-                probs = probs/np.sum(probs)
-                sp = np.random.choice(sp_candidates, p=probs)
-                selected_prob = probs[sp_candidates.index(sp)]
-                probs_selected.append(selected_prob)
+            gmean_prob_per_sequence = gmean_prob_per_sequence[include_list==True]
+            mean_prob_per_sequence = mean_prob_per_sequence[include_list==True]
+            gen_logits_per_sequence = gen_logits_per_sequence[include_list==True]
+            #losses = np.array(losses)[include_list==True]
 
-                # calculate intermediate rewards
-                rewards = score_sentiment(sp_candidates, sentiment_tokenizer, sentiment_model, device)
-                selected_reward = rewards[sp_candidates.index(sp)]
-                rewards_received.append(selected_reward)
+            if len(decoded)==0:
+                break
 
-                if args.verbose:
-                    print(f'{s}')
-                    for _sp,_p,_r in zip(sp_candidates, probs, rewards):
-                        print(f' .. {_sp} p={_p:.3f} r={_r:.3f}') # v..
+            # modify candidates, remove ones that are too similar
+            sp_candidates = []
+            include_list = []
+            for d in decoded:
+                include=True
+                #candidate = d.split('.')[-2].strip()+'.'
+                candidate = d.replace(s, '').strip()
+                if candidate.count('.')!=1:
+                    include=False
 
-                s =  s + ' ' +sp
+                seq_matches = np.array([SequenceMatcher(None, candidate, s_prev).ratio() for s_prev in state_storage])
+                if np.any(seq_matches>0.8):
+                    include=False
 
-                if args.verbose:
-                    print(f'{s} p={selected_prob:.3f} r={selected_reward:.3f}')
-                    #import ipdb; ipdb.set_trace()
+                include_list.append(include)
+                if include:
+                    sp_candidates.append(candidate)
 
-            probs_selected_str = ','.join([str(np.round(p,3)) for p in probs_selected])
-            rewards_received_str = ','.join([str(np.round(p,3)) for p in rewards_received])
-            traj = f'{s} p={probs_selected_str} r={rewards_received_str}\n'
+            if len(sp_candidates)==0:
+                break
 
-            # save results
-            filename1 = Path(args.save_folder) / 'generations.txt'
-            with open(filename1, 'w' if i==0 else 'a') as f1:
-                f1.write(traj)
+            include_list = np.array(include_list)
+            gmean_prob_per_sequence = gmean_prob_per_sequence[include_list==True]
+            mean_prob_per_sequence = mean_prob_per_sequence[include_list==True]
+            gen_logits_per_sequence = gen_logits_per_sequence[include_list==True]
 
-        except:
-            import ipdb; ipdb.set_trace()
+            # calculate probabilities
+            res = entailment_classifier(s, sp_candidates)
+            probs = np.array(res['scores'])
+            probs = np.exp(probs/1.05) / np.sum(np.exp(probs/1.05)) # slightly extra noise to prevent repetition
+            probs = probs/np.sum(probs)
+
+            # re order
+            reorder_idx = [sp_candidates.index(s) for s in res['labels']]
+            sp_candidates_re = [sp_candidates[i] for i in reorder_idx]
+            assert sp_candidates_re==res['labels']
+            sp_candidates = sp_candidates_re
+
+            gmean_prob_per_sequence = gmean_prob_per_sequence[reorder_idx]
+            mean_prob_per_sequence = mean_prob_per_sequence[reorder_idx]
+            gen_logits_per_sequence = gen_logits_per_sequence[reorder_idx]
+            #losses = losses[reorder_idx]
+
+            #p_gmean = gmean_prob_per_sequence / np.sum(gmean_prob_per_sequence)
+            p_mean = mean_prob_per_sequence / np.sum(mean_prob_per_sequence)
+            p_log = gen_logits_per_sequence / np.sum(gen_logits_per_sequence)
+            #import ipdb; ipdb.set_trace()
+            #p_loss = -1*losses / np.sum(-1*losses)
+
+            sp = np.random.choice(sp_candidates, p=probs)
+            #sp = np.random.choice(sp_candidates, p=p_mean)
+            selected_prob = probs[sp_candidates.index(sp)]
+            probs_selected.append(selected_prob)
+
+            # calculate intermediate rewards
+            rewards = score_sentiment(sp_candidates, sentiment_tokenizer, sentiment_model, device)
+            selected_reward = rewards[sp_candidates.index(sp)]
+            rewards_received.append(selected_reward)
+            state_storage.append(sp)
+
+            if args.verbose:
+                print(f'{s}')
+                #for _sp,_p,_r in zip(sp_candidates, probs, rewards):
+                #    print(f' .. {_sp} p={_p:.3f} r={_r:.3f}') # v..
+                for _sp,_p,_pm,_pl, _r in zip(sp_candidates, probs, p_mean, p_log, rewards):
+                    print(f' .. {_sp} p={_p:.3f} pm={_pm:.3f} pl={_pl:.3f} r={_r:.3f}') # v..
+
+            s =  s + ' ' +sp
+
+            if args.verbose:
+                print(f'{s} p={selected_prob:.3f} r={selected_reward:.3f}')
+                import ipdb; ipdb.set_trace()
+
+        # can also score sentiment of the entire thing here
+        Ret = score_sentiment(s, sentiment_tokenizer, sentiment_model, device)[0]
+        Ret = np.round(Ret,3)
+
+        probs_selected_str = ','.join([str(np.round(p,3)) for p in probs_selected])
+        rewards_received_str = ','.join([str(np.round(p,3)) for p in rewards_received])
+        traj = f'{s} p={probs_selected_str} r={rewards_received_str} r_all={Ret}\n'
+
+        # save results
+        filename1 = Path(args.save_folder) / f'generations_seed{args.seed}.txt'
+        with open(filename1, 'w' if i==0 else 'a') as f1:
+            f1.write(traj)
+
 
 if __name__ == '__main__':
 
     main()
 
 
-    # CUDA_VISIBLE_DEVICES=3 python generate_sentence_chains.py  --model models/pretrained/gpt2-large --num_iterations 1000
-    # CUDA_VISIBLE_DEVICES=3 python generate_sentence_chains.py  --model models/pretrained/gpt2-large --num_iterations 100
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentence_chains.py  --model models/pretrained/gpt2-large --num_iterations 10000 --seed 1 --verbose
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentence_chains.py  --model models/pretrained/gpt2-large --num_iterations 10000 --seed 2 --verbose
+    # CUDA_VISIBLE_DEVICES=3 python generate_sentence_chains.py  --model models/pretrained/gpt2-large --num_iterations 10000 --seed 3
+    # CUDA_VISIBLE_DEVICES=2 python generate_sentence_chains.py  --model models/pretrained/gpt2-large --num_iterations 10000 --seed 4
