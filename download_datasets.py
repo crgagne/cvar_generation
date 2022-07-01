@@ -11,8 +11,8 @@ def download_and_save(dataset_name, specs = None):
 
 def main():
 
-    download_and_save('social_i_qa') # https://huggingface.co/datasets/go_emotions (there's also a 'raw' version which is not split)
-
+    #download_and_save('social_i_qa') # https://huggingface.co/datasets/go_emotions (there's also a 'raw' version which is not split)
+    download_and_save('go_emotions')
 
 
 if __name__ == '__main__':

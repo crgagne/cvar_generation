@@ -16,17 +16,23 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import DataCollatorWithPadding
 from tqdm import tqdm
 import pickle
+import pandas as pd
 
 # from torch.utils.data.dataloader import default_collate this doesn't work with hugging face dataset
 from transformers import default_data_collator
 from batch_datasets import get_batch_dataset
 from rl_learner import TD_Learner
 
+EMOTIONS = ['admiration','amusement','anger','annoyance','approval','caring',
+ 'confusion','curiosity','desire','disappointment','disapproval','disgust','embarrassment',
+ 'excitement','fear','gratitude','grief','joy','love','nervousness','optimism','pride',
+ 'realization','relief','remorse','sadness','surprise','neutral']
+
 def huber(x, k=1.0):
     return torch.where(x.abs() < k, 0.5 * x.pow(2), k * (x.abs() - 0.5 * k))
     # consider nn.functional.HuberLoss(diff) # reduction = None
 
-def prepare_data(args, tokenizer):
+def prepare_data(args, tokenizer, split='train'):
 
     if args.mdp_mode:
 
@@ -43,25 +49,45 @@ def prepare_data(args, tokenizer):
 
     else:
         # load dataset
-        dataset = get_batch_dataset(args.data)
+        dataset = get_batch_dataset(args.data, split=split)
 
         # tokenize
         def tokenize(batch):
            return tokenizer(batch['text'], truncation=True, max_length=args.max_length, padding='max_length')
         dataset = dataset.map(tokenize, num_proc=1, batched=True)
 
-        if args.filter is not None:
+        if args.filter != None:
             dataset = dataset.filter(lambda example: example['text'].startswith(args.filter))
 
         # tensorize sentiment
         def tensorize(batch):
             batch['sentiment']=[torch.Tensor([sentiment]) for sentiment in batch['sentiment']]
+            if EMOTIONS[0] in batch:
+                for emotion in EMOTIONS:
+                    batch[emotion]=[torch.Tensor([sentiment]) for sentiment in batch[emotion]]
             return(batch)
         dataset = dataset.map(tensorize, num_proc=1, batched=True)
 
         # filter potentially #
         if args.filter_out is not None:
             dataset = dataset.filter(lambda example: not example['text'].startswith(args.filter_out))
+
+        if args.more_balanced=='True':
+
+            print(f' datatset size {len(dataset)}')
+            def tmp_filter_func(example):
+                keep=True
+                p = 0.5 / len(args.emotion_set) # so it's similar for single / double emotions
+                for emotion in args.emotion_set:
+                    if example[emotion][0]<0.05:
+                        if np.random.binomial(p=p,n=1)==1:
+                            keep=False
+                    if example[emotion][0]>0.05: # otherwise it will remove some of the other category
+                        keep=True
+
+                return(keep)
+            dataset = dataset.filter(tmp_filter_func)
+            print(f' datatset size {len(dataset)}')
 
         # batch data
         def collate_with_strings(batch, str_column = 'text'):
@@ -74,9 +100,13 @@ def prepare_data(args, tokenizer):
         train_data = DataLoader(dataset, collate_fn=collate_with_strings, batch_size=args.batch_size, shuffle=True)
         state_dim = None
 
-    return(train_data, state_dim)
 
-def calc_state_from_batch(batch, device, model, mdp_mode=False):
+        if split=='validation':
+            return(train_data, state_dim, dataset)
+        else:
+            return(train_data, state_dim)
+
+def calc_state_from_batch(batch, device, model, mdp_mode=False, emotion='None'):
 
     if mdp_mode:
         states = batch[0].to(device)
@@ -86,9 +116,17 @@ def calc_state_from_batch(batch, device, model, mdp_mode=False):
     else:
         mask = batch['attention_mask'].to(device)
         input_ids = batch['input_ids'].to(device)
-        rewards = batch['sentiment'].to(device)
+        if emotion=='None':
+            rewards = batch['sentiment'].to(device)
+        elif '+' in emotion:
+            emotion_set = emotion.split('+')
+            rewards = torch.max(batch[emotion_set[0]],batch[emotion_set[1]])
+        else:
+            rewards = batch[emotion].to(device)
 
-        # TODO: consider precomputing hidden states
+        #if emotion!='None':
+        #    rewards = 1.0 - rewards
+
         with torch.no_grad():
             output = model(input_ids=input_ids,
                            attention_mask=mask,
@@ -112,6 +150,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/pretrained/gpt2-large")
+    parser.add_argument("--emotion", type=str, default="None")
     parser.add_argument("--data", type=str, default='data/results/single_sentences_IYou_6/full_generations.txt')
     parser.add_argument('--gpus', default=1, type=int)
     parser.add_argument("--seed", type=int, default=2311)
@@ -127,6 +166,7 @@ def main():
     parser.add_argument("--target_every", type=int, default=10)
     parser.add_argument("--huber_k", type=float, default=0.1)
     parser.add_argument("--filter_out", type=str, default=None)
+    parser.add_argument("--more_balanced", type=str, default=None)
 
     args = parser.parse_args()
     extra_save = '_linear' if args.linear else '_'+str(args.hidden_dim)
@@ -135,6 +175,16 @@ def main():
         extra_save += '_'+str(args.huber_k)
     if 'full_generations' in args.data:
         extra_save += '_'+'prompt_enc'
+    if args.emotion != 'None':
+        extra_save += '_'+args.emotion
+
+    if args.emotion != 'None':
+        args.more_balanced = 'True'
+
+    if '+' in args.emotion:
+        args.emotion_set = args.emotion.split('+')
+    else:
+        args.emotion_set = [args.emotion]
 
     if args.mdp_mode:
         args.save_path = Path(args.data).parent / ('quantile_learner_mdp2'+extra_save) / 'quantile_learner_mdp.pkl'
@@ -164,7 +214,10 @@ def main():
         model = None; tokenizer=None
 
     # get data
-    train_data, state_dim = prepare_data(args, tokenizer)
+    train_data, state_dim = prepare_data(args, tokenizer, split='train')
+    eval_data, state_dim_eval, eval_dataset = prepare_data(args, tokenizer, split='validation')
+    eval_df = pd.DataFrame(eval_dataset)
+
     if model is not None:
         state_dim = model.config.n_embd
 
@@ -193,9 +246,9 @@ def main():
 
         epoch_loss = 0
 
-        for idx, (batch, text) in tqdm(enumerate(train_data, start=1), leave=True, position=0):
+        for idx, (batch, text) in tqdm(enumerate(train_data, start=1), leave=True, position=0, total=len(train_data)):
 
-            states, mask, rewards, input_ids = calc_state_from_batch(batch, device, model, mdp_mode=args.mdp_mode)
+            states, mask, rewards, input_ids = calc_state_from_batch(batch, device, model, mdp_mode=args.mdp_mode, emotion=args.emotion)
 
             optimizer.zero_grad()
 
@@ -254,15 +307,17 @@ def main():
                 log_dict = append_to_log(log_dict, f'state {state}', theta_hats)
         else:
 
-            examples = ['I left the house. I drove to work.',
-                        'I left the house. I drove to work. My',
-                        'I left the house. I drove to work. My boss',
-                        'You left the house. You drove to work.',
-                        'You left the house. You drove to work. Your',
-                        'You left the house. You drove to work. Your boss',
-                        'I left the house. I drove to work. It was the worst',
-                        'I left the house. I drove to work. It was the']
+            examples = []
 
+            # first get examples from the type of emotion (from validation set)
+            #emotion_set = args.emotion_set
+            emotion_set = ['anger','annoyance','sadness','grief','fear','nervousness', 'admiration','optimism']
+
+            for emotion in emotion_set:
+                #eval_df.sort_values(by=emotion, ascending=False).iloc[0:10][['text', emotion]] # to inspect
+                examples.extend(list(eval_df.sort_values(by=emotion, ascending=False).iloc[0:10]['text'].values))
+
+            # make predictions on the examples
             for example in examples:
                 input = tokenizer(example, return_tensors='pt').to(device)
                 with torch.no_grad():
@@ -275,6 +330,11 @@ def main():
                 print(f' example: {example}')
                 print(f' theta_hats: {theta_hats_last}')
                 log_dict = append_to_log(log_dict, example, theta_hats_last)
+                log_dict = append_to_log(log_dict, 'exnd_'+example, theta_hats)
+
+            # now, what about a more quantitative measure of performance?
+            # TO-DO:
+            # One option is to look at the mean; that's important; but then I'll also need a metric of the distribution
 
         # save the model and the log
         if (epoch) % 1 == 0 and epoch !=0:
@@ -329,3 +389,16 @@ if __name__ == '__main__':
     # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 50 --batch_size 10 --linear --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 2e-5 --data 'data/results/single_sentences_IYou_6/full_generations.txt'
 
     # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 10 --batch_size 10 --linear --n_quantiles 12 --target_every 10 --huber_k 0.01 --learning_rate 2e-5 --data 'data/results/single_sentences_IYou_6/full_generations.txt'
+
+
+    # Dataset v3 with emotions
+    # CUDA_VISIBLE_DEVICES=1 python train_rl_batch.py --epochs 100 --batch_size 10 --hidden_dim 104 --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'anger+annoyance'
+    # CUDA_VISIBLE_DEVICES=0 python train_rl_batch.py --epochs 100 --batch_size 10 --hidden_dim 104 --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'sadness+grief'
+    # CUDA_VISIBLE_DEVICES=2 python train_rl_batch.py --epochs 100 --batch_size 10 --hidden_dim 104 --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'fear+nervousness'
+    # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 100 --batch_size 10 --hidden_dim 104 --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt'
+
+    # CUDA_VISIBLE_DEVICES=2 python train_rl_batch.py --epochs 50 --batch_size 10 --hidden_dim 104 --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'admiration'
+    # CUDA_VISIBLE_DEVICES=3 python train_rl_batch.py --epochs 50 --batch_size 10 --hidden_dim 104 --n_quantiles 10 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'optimism'
+
+    ## running linear
+    # CUDA_VISIBLE_DEVICES=0 python train_rl_batch.py --epochs 20 --batch_size 10 --linear --n_quantiles 12 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'sadness+grief'

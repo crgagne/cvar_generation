@@ -71,12 +71,6 @@ def main():
         tokenizer = GPT2Tokenizer.from_pretrained(args.model)
         model = GPT2LMHeadModel.from_pretrained(args.model, config=config)
         model.config.pad_token_id = model.config.eos_token_id
-    elif 'gpt-j' in args.model:
-        import ipdb; ipdb.set_trace()
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16) # optional to include this precision
-        if args.gpus==0: # haven't tried yet
-            model = GPTJForCausalLM.from_pretrained(args.model, revision="float16", torch_dtype=torch.float16, low_cpu_mem_usage=True)
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     model.to(device)
 
@@ -98,11 +92,8 @@ def main():
         else:
             prompt =  np.random.choice(prompts, size=1)[0]
 
-        #import ipdb; ipdb.set_trace()
-
         #if np.random.binomial(n=1, p=0.5)==1:
         #    prompt = prompt.replace('I', 'You')
-
 
         # tokenize
         inputs = tokenizer(prompt, return_tensors='pt').to(device)

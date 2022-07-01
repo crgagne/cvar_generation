@@ -83,8 +83,14 @@ def sample(
     tokenized_prompt = None,
     step_by_step=False,
     use_prompt_for_dist = False,
+    flip_rewards = False,
+    pcvar = True,
+    verbose = True,
     **model_kwargs,
 ) -> Union[SampleDecoderOnlyOutput, torch.LongTensor]:
+
+    if step_by_step:
+        verbose=True
 
     # init attention / hidden states / scores tuples
     scores = () if (return_dict_in_generate and output_scores) else None
@@ -102,9 +108,9 @@ def sample(
         alphas = np.append(np.insert(taus, 0, 0), 1) # add zero, one
 
     if cvar_alpha!=1.:
-        pcvar=True
+        sample_w_cvar=True
     else:
-        pcvar=False
+        sample_w_cvar=False
 
     alpha_storage = [cvar_alpha]
     p_storage = []
@@ -199,12 +205,13 @@ def sample(
             sort_idx = torch.argsort(probs_detached, dim=-1, descending=True) # can actually do by batch
             top_tokens = sort_idx[0:top_k]
             top_probs = probs_detached[sort_idx][0:top_k] # TODO:
-            print(tokenizer.decode(input_ids[0]))
-            print(f'top tokens: {tokenizer.decode(top_tokens)}')
-            print(f'p:\t{top_probs.numpy().round(2)}')
+            if verbose:
+                print(tokenizer.decode(input_ids[0]))
+                print(f'top tokens: {tokenizer.decode(top_tokens)}')
+                print(f'p:\t{top_probs.numpy().round(2)}')
 
 
-        if pcvar:
+        if sample_w_cvar:
 
             # get next state value distribution
             Vp = []
@@ -227,6 +234,8 @@ def sample(
                 states = outputs_inner['hidden_states'][-1][:,-1,:].unsqueeze(1)
                 with torch.no_grad():
                     thetas = Z_network(states).detach().cpu().numpy().squeeze()
+                if flip_rewards:
+                    thetas = (-1.*thetas)[::-1] # [lowest negative score to 0] corresponds to alpha [0, 0.05, .., 1]
                 cvars = calc_cvar_from_quantiles(thetas, taus, alphas)
                 Vp.append(cvars)
                 Vp_quantiles.append(thetas)
@@ -245,11 +254,12 @@ def sample(
             assert probs.shape[0]==1
             for idx, pd in zip(sort_idx[0:top_k], p_distorted):
                 probs[:,int(idx)]=pd
-            print(f'pd:\t{p_distorted.round(2)}')
-            print(f'diff:\t{(p_distorted-top_probs.numpy()).round(2)}')
-            print(cvar_alpha)
-            print(f'cvar0:\t{Vp[:,0].round(2)}')
-            print(f'cvar1:\t{Vp[:,-1].round(2)}')
+            if verbose:
+                print(f'pd:\t{p_distorted.round(2)}')
+                print(f'diff:\t{(p_distorted-top_probs.numpy()).round(2)}')
+                print(cvar_alpha)
+                print(f'cvar0:\t{Vp[:,0].round(2)}')
+                print(f'cvar1:\t{Vp[:,-1].round(2)}')
             if step_by_step:
                 import ipdb; ipdb.set_trace()
 
@@ -260,9 +270,11 @@ def sample(
         selected_tok_scores_all.append(selected_tok_scores)
 
         # adjust alpha
-        if pcvar:
+        if sample_w_cvar and pcvar:
             cvar_alpha = float(xis[top_tokens.cpu().numpy()==next_tokens.detach().cpu().numpy()]*cvar_alpha)
             cvar_alpha = np.max(np.min((cvar_alpha,1)),0)
+            alpha_storage.append(cvar_alpha)
+        elif sample_w_cvar and not pcvar:
             alpha_storage.append(cvar_alpha)
 
         # finished sentences should have their next token be a padding token
@@ -338,6 +350,9 @@ def generate(
         tokenized_prompt = None,
         step_by_step = False,
         use_prompt_for_dist = False,
+        flip_rewards = False,
+        pcvar = True,
+        verbose = True,
         **model_kwargs):
 
         # Dealing with arguments #
@@ -412,5 +427,8 @@ def generate(
             tokenized_prompt = tokenized_prompt,
             step_by_step = step_by_step,
             use_prompt_for_dist = use_prompt_for_dist,
+            flip_rewards = flip_rewards,
+            pcvar = pcvar,
+            verbose = verbose,
             **model_kwargs,
         )

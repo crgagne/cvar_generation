@@ -9,7 +9,7 @@ from transformers import (
     AutoModelForSequenceClassification,
     GPTJForCausalLM,
     GPT2Tokenizer,
-    OPTForCausalLM
+    #OPTForCausalLM
 )
 
 from transformers import GPTJForCausalLM
@@ -19,7 +19,7 @@ def download_and_save(modelname, half=False):
 
     warnings.warn("Using Auto* Methods to guess model")
 
-    if 'sentiment' in modelname:
+    if 'sentiment' in modelname or 'emotion' in modelname:
         model = AutoModelForSequenceClassification.from_pretrained(modelname) # otherwise it doesn't guess the right model; that's dumb
         tokenizer = AutoTokenizer.from_pretrained(modelname)
     elif 'gpt-j' in modelname:
@@ -57,8 +57,9 @@ def main():
     #download_and_save("gpt2-large")
     #download_and_save("EleutherAI/gpt-j-6B")
     #download_and_save("facebook/opt-350m")
-    download_and_save("facebook/opt-2.7b", half=True)
+    #download_and_save("facebook/opt-2.7b", half=True) # the half doesn't work
     #download_and_save("facebook/opt-1.3b")
+    download_and_save("monologg/bert-base-cased-goemotions-original")
 
 if __name__ == '__main__':
     main()

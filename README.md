@@ -11,7 +11,7 @@ conda activate /home/cgagne/cvar_generation/conda_env
 
 jupyter-notebook --no-browser --port=8889 --ip=0.0.0.0
 
-ssh -N -f -L localhost:8890:compute-1:8889 cgagne@nyx.hpc.kyb.local
+ssh -N -f -L localhost:8890:compute-6:8889 cgagne@nyx.hpc.kyb.local
 
 # Tmux
 resize-p -U 6
@@ -36,7 +36,7 @@ conda install seaborn
 
 # installing newer version of transformers in my home directory (using the github way of install, which is super cool)
 
-I just access it using (base) environment 
+I just access it using (base) environment
 
 # other things installed but not necessary (for quantile dqn code)
 

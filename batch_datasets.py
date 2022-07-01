@@ -3,7 +3,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 
-def get_batch_dataset(dataset_name, cache_dir='~/cvar_generation/cache', n_rewards=3):
+def get_batch_dataset(dataset_name, cache_dir='~/cvar_generation/cache', n_rewards=3, split='train'):
 
     if dataset_name=='The/A':
         # load dataset
@@ -34,7 +34,7 @@ def get_batch_dataset(dataset_name, cache_dir='~/cvar_generation/cache', n_rewar
                                cache_dir=cache_dir,
                                n_rewards=n_rewards)
 
-        dataset=dataset['train']
+        dataset=dataset[split]
 
     else:
 
@@ -43,7 +43,7 @@ def get_batch_dataset(dataset_name, cache_dir='~/cvar_generation/cache', n_rewar
                                data_filepath=dataset_name,
                                cache_dir=cache_dir)
 
-        dataset=dataset['train']
+        dataset=dataset[split]
 
     return(dataset)
 
