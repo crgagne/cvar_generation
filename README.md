@@ -11,7 +11,9 @@ conda activate /home/cgagne/cvar_generation/conda_env
 
 jupyter-notebook --no-browser --port=8889 --ip=0.0.0.0
 
+kill $(lsof -t -i:8890)
 ssh -N -f -L localhost:8890:compute-6:8889 cgagne@nyx.hpc.kyb.local
+ssh -N -f -L localhost:8890:gpu-1:8889 cgagne@nyx.hpc.kyb.local
 
 # Tmux
 resize-p -U 6

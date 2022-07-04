@@ -32,7 +32,7 @@ def huber(x, k=1.0):
     return torch.where(x.abs() < k, 0.5 * x.pow(2), k * (x.abs() - 0.5 * k))
     # consider nn.functional.HuberLoss(diff) # reduction = None
 
-def prepare_data(args, tokenizer, split='train'):
+def prepare_data(args, tokenizer, split='train', subset=False):
 
     if args.mdp_mode:
 
@@ -48,8 +48,12 @@ def prepare_data(args, tokenizer, split='train'):
         train_data = DataLoader(dataset, collate_fn=collate_with_extra_empty, batch_size=args.batch_size, shuffle=True)
 
     else:
+
         # load dataset
         dataset = get_batch_dataset(args.data, split=split)
+
+        if subset:
+            dataset.select(range(50_000))
 
         # tokenize
         def tokenize(batch):
@@ -100,7 +104,6 @@ def prepare_data(args, tokenizer, split='train'):
         train_data = DataLoader(dataset, collate_fn=collate_with_strings, batch_size=args.batch_size, shuffle=True)
         state_dim = None
 
-
         if split=='validation':
             return(train_data, state_dim, dataset)
         else:
@@ -123,9 +126,6 @@ def calc_state_from_batch(batch, device, model, mdp_mode=False, emotion='None'):
             rewards = torch.max(batch[emotion_set[0]],batch[emotion_set[1]])
         else:
             rewards = batch[emotion].to(device)
-
-        #if emotion!='None':
-        #    rewards = 1.0 - rewards
 
         with torch.no_grad():
             output = model(input_ids=input_ids,
@@ -151,30 +151,37 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/pretrained/gpt2-large")
     parser.add_argument("--emotion", type=str, default="None")
-    parser.add_argument("--data", type=str, default='data/results/single_sentences_IYou_6/full_generations.txt')
+    #parser.add_argument("--data", type=str, default='data/results/single_sentences_IYou_6/full_generations.txt')
+    parser.add_argument("--data", type=str, default='/home/cgagne/cvar_generation/data/preprocessed/SMHD_posts_depctrl_v1_w_emosent_subsample')
+    parser.add_argument("--results_folder", type=str, default='data/results/single_sentences_posts_v1')
     parser.add_argument('--gpus', default=1, type=int)
-    parser.add_argument("--seed", type=int, default=2311)
-    parser.add_argument("--batch_size", type=int, default=40)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--n_quantiles", type=int, default=20)
     parser.add_argument("--mdp_mode", action='store_true')
-    parser.add_argument("--max_length", type=int, default=30)
+    parser.add_argument("--max_length", type=int, default=50)
     parser.add_argument("--filter", type=str, default=None)
     parser.add_argument("--linear", action='store_true')
-    parser.add_argument("--hidden_dim", type=int, default=102)
+    parser.add_argument("--hidden_dim", type=int, default=100)
     parser.add_argument("--target_every", type=int, default=10)
     parser.add_argument("--huber_k", type=float, default=0.1)
     parser.add_argument("--filter_out", type=str, default=None)
     parser.add_argument("--more_balanced", type=str, default=None)
+    parser.add_argument("--subset", action='store_true')
 
     args = parser.parse_args()
     extra_save = '_linear' if args.linear else '_'+str(args.hidden_dim)
     extra_save += '_'+args.filter.replace(' ','_') if args.filter is not None else ''
+
     if args.huber_k !=1:
         extra_save += '_'+str(args.huber_k)
+
     if 'full_generations' in args.data:
         extra_save += '_'+'prompt_enc'
+    ## TODO: DO I NEED TO CONSIDER THE PROMPT?
+
     if args.emotion != 'None':
         extra_save += '_'+args.emotion
 
@@ -186,11 +193,16 @@ def main():
     else:
         args.emotion_set = [args.emotion]
 
+    if args.results_folder == 'None':
+        results_folder = Path(args.data).parent
+    else:
+        results_folder = Path(args.results_folder)
+
     if args.mdp_mode:
-        args.save_path = Path(args.data).parent / ('quantile_learner_mdp2'+extra_save) / 'quantile_learner_mdp.pkl'
+        args.save_path = results_folder / ('quantile_learner_mdp2'+extra_save) / 'quantile_learner_mdp.pkl'
         args.log_path  = args.save_path.parent  / 'log_quantile_learner_mdp.pkl'
     else:
-        args.save_path = Path(args.data).parent / ('quantile_learner'+extra_save) /  'quantile_learner.pkl'
+        args.save_path = results_folder / ('quantile_learner'+extra_save) /  'quantile_learner.pkl'
         args.log_path  = args.save_path.parent / 'log_quantile_learner.pkl'
 
     print(f'saving to : {args.save_path}')
@@ -207,15 +219,20 @@ def main():
         config = GPT2Config.from_pretrained(args.model)
         tokenizer = GPT2Tokenizer.from_pretrained(args.model)
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.add_special_tokens({
+            "additional_special_tokens": [
+                "<|generate|>","<|score|>"
+        ]})
         model = GPT2LMHeadModel.from_pretrained(args.model, config=config)
+        model.resize_token_embeddings(len(tokenizer))
         model.to(device)
 
     else:
         model = None; tokenizer=None
 
     # get data
-    train_data, state_dim = prepare_data(args, tokenizer, split='train')
-    eval_data, state_dim_eval, eval_dataset = prepare_data(args, tokenizer, split='validation')
+    train_data, state_dim = prepare_data(args, tokenizer, split='train', subset=args.subset)
+    eval_data, state_dim_eval, eval_dataset = prepare_data(args, tokenizer, split='validation', subset=args.subset)
     eval_df = pd.DataFrame(eval_dataset)
 
     if model is not None:
@@ -402,3 +419,7 @@ if __name__ == '__main__':
 
     ## running linear
     # CUDA_VISIBLE_DEVICES=0 python train_rl_batch.py --epochs 20 --batch_size 10 --linear --n_quantiles 12 --target_every 5 --huber_k 0.1 --learning_rate 1e-4 --data 'data/results/single_sentences_IYou_3_emo/cmbnd_full_generations_w_emotions_shfld.txt' --emotion 'sadness+grief'
+
+
+    ## running with posts dataset
+    # CUDA_VISIBLE_DEVICES=0 python train_rl_batch.py

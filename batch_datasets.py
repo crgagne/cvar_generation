@@ -1,4 +1,4 @@
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset, concatenate_datasets, load_from_disk
 import argparse
 from pathlib import Path
 import numpy as np
@@ -35,6 +35,13 @@ def get_batch_dataset(dataset_name, cache_dir='~/cvar_generation/cache', n_rewar
                                n_rewards=n_rewards)
 
         dataset=dataset[split]
+
+    elif 'SMHD_posts' in dataset_name:
+
+        dataset = load_from_disk(dataset_name)[split]
+        dataset = dataset.rename_column('post', 'text')
+
+        print('WARNING: NEED TO FILTER NANSSSS')
 
     else:
 

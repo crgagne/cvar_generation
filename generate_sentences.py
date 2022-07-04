@@ -45,13 +45,14 @@ def main():
     # parse args
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="models/pretrained/gpt2-large")
+    #parser.add_argument("--model", type=str, default="models/finetuned/gpt2-large/SMHD_posts_depctrl_v1/checkpoint-2400")
     parser.add_argument('--gpus', default=1, type=int,
         help='number of gpus per node')
     parser.add_argument("--seed", type=int, default=2311)
     parser.add_argument("--num_iterations", type=int, default=10)
-    parser.add_argument("--save_folder", type=str, default='single_sentences_IYou_7GPTJ')
+    parser.add_argument("--save_folder", type=str, default='single_sentences_longer_reddit_v1')
     parser.add_argument("--prompt_list", type=str, default="prompt_list.txt")
-    parser.add_argument("--max_length", type=int, default=20)
+    parser.add_argument("--max_length", type=int, default=50)
     parser.add_argument("--comp_prompts", action='store_true')
     parser.add_argument("--top_k", type=int, default=10)
     args = parser.parse_args()
@@ -66,11 +67,20 @@ def main():
         device='cpu'
 
     # load model
-    if 'gpt-2' in args.model:
+    if 'gpt2' in args.model:
+        # load model add new tokens
         config = GPT2Config.from_pretrained(args.model)
         tokenizer = GPT2Tokenizer.from_pretrained(args.model)
+        tokenizer.add_special_tokens({
+            "additional_special_tokens": [
+                "<|generate|>","<|score|>","<|pad|>"
+        ]})
+        tokenizer.pad_token = tokenizer.encode("<|pad|>")
         model = GPT2LMHeadModel.from_pretrained(args.model, config=config)
-        model.config.pad_token_id = model.config.eos_token_id
+        model.resize_token_embeddings(len(tokenizer))
+
+    eos_token_id = 13 # for periods
+    #eos_token_id = 50258 # for score
 
     model.to(device)
 
@@ -94,12 +104,15 @@ def main():
 
         #if np.random.binomial(n=1, p=0.5)==1:
         #    prompt = prompt.replace('I', 'You')
+        if 'finetuned' in args.model:
+            prompt = '<|generate|>'+prompt
 
         # tokenize
         inputs = tokenizer(prompt, return_tensors='pt').to(device)
 
         if 'gpt-2' in args.model:
-            bad_words = ["\n", "\r", '"']
+            #bad_words = ["\n", "\r", '"']
+            bad_words = ["\n", "\r", '"',' "',' (',' )',' [',' ]','."','?"',',"']
             bad_words_ids = [tokenizer.encode(bad_word, add_prefix_space=True) for bad_word in bad_words]
         else:
             bad_words = ["\n", "\r", '"']
@@ -109,11 +122,16 @@ def main():
         output, _ = generate(model, tokenizer,
                             input_ids=inputs['input_ids'],
                             attention_mask=inputs['attention_mask'],
-                            max_length=inputs['input_ids'].shape[1]+args.max_length, num_beams = 1,
-                            temperature=1, num_return_sequences=10,
-                            do_sample=True, eos_token_id=13,
+                            max_length=inputs['input_ids'].shape[1]+args.max_length,
+                            num_beams = 1,
+                            temperature=1,
+                            num_return_sequences=10,
+                            do_sample=True,
+                            eos_token_id=eos_token_id,
+                            pad_token_id=tokenizer.pad_token_id,
                             bad_words_ids = bad_words_ids,
-                            top_k = args.top_k, top_p=0.95,
+                            top_k = args.top_k,
+                            top_p=0.95,
                             allowed_word_ids = None,
                             )
 
@@ -127,12 +145,12 @@ def main():
         include=True
         d = d.replace('\n','').replace('\r','').replace('"','')
         d = d.replace('[','').replace(']','')
-        if d[-1]!='.':
-            include=False
-        if '?' in d:
-            include=False
-        if has_numbers(d):
-            include=False
+        #if d[-1]!='.':
+        #    include=False
+        #if '?' in d:
+        #    include=False
+        #if has_numbers(d):
+        #    include=False
         num_words = d.split(' ')
         if len(num_words)<3:
             include=False
@@ -161,8 +179,12 @@ def main():
     ends = [ends[i] for i in sort_idx]
 
     # save results
-    filename1 = Path(args.save_folder) / 'full_generations.txt'
-    filename2 = Path(args.save_folder) / 'ends.txt'
+    if 'finetuned' in args.model:
+        filename1 = Path(args.save_folder) / 'full_generations_ft.txt'
+        filename2 = Path(args.save_folder) / 'ends_ft.txt'
+    else:
+        filename1 = Path(args.save_folder) / 'full_generations.txt'
+        filename2 = Path(args.save_folder) / 'ends.txt'
     with open(filename1, 'w') as f1, open(filename2, 'w') as f2:
         for gen, end, r in zip(decoded, ends, rewards):
             line = f"{gen} r={r:.3f}\n"
@@ -181,3 +203,7 @@ if __name__ == '__main__':
     # CUDA_VISIBLE_DEVICES=2 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 1000
 
     # CUDA_VISIBLE_DEVICES=3 python generate_sentences.py  --model models/pretrained/EleutherAI-gpt-j-6B --num_iterations 10 --gpus 0
+
+    # comparing finetuned gpt-2 to not ..
+    # CUDA_VISIBLE_DEVICES=1 python generate_sentences.py  --model models/finetuned/gpt2-large/SMHD_posts_depctrl_v1/checkpoint-2400 --num_iterations 10 --gpus 1
+    # CUDA_VISIBLE_DEVICES=1 python generate_sentences.py  --model models/pretrained/gpt2-large --num_iterations 10000 --gpus 1
